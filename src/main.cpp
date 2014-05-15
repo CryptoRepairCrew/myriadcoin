@@ -3731,9 +3731,88 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     else if (strCommand == "verack")
     {
         pfrom->SetRecvVersion(min(pfrom->nVersion, PROTOCOL_VERSION));
+        pfrom->PushMessage("dseg");
     }
 
+    else if (strCommand == "dseg") { //DarkSend Election Get
+        if (pfrom->nVersion != darkSendPool.MIN_PEER_PROTO_VERSION) {
+           return false;
+        }
 
+        int count = darkSendMasterNodes.size()-1;
+        int i = 0;
+
+        BOOST_FOREACH(CMasterNode mn, darkSendMasterNodes) {
+            printf("Sending master node entry - %s \n", mn.addr.ToString().c_str());
+            mn.Check();
+            if(mn.IsEnabled()) {
+                pfrom->PushMessage("dsee", mn.vin, mn.addr, mn.sig, mn.now, mn.pubkey, count, i);
+                i++;
+            }
+        }
+    }
+
+    else if (strCommand == "dsee") { //DarkSend Election Entry   
+        if (pfrom->nVersion != darkSendPool.MIN_PEER_PROTO_VERSION) {
+            return false;
+        }
+        CTxIn vin;
+        CService addr;
+        CPubKey pubkey;
+        vector<unsigned char> vchSig;
+        int64 sigTime;
+        int count;
+        int current;
+        vRecv >> vin >> addr >> vchSig >> sigTime >> pubkey >> count >> current;
+
+        std::string strMessage = addr.ToString() + boost::lexical_cast<std::string>(sigTime);
+
+        std::string errorMessage = "";
+        if(!darkSendSigner.VerifyMessage(pubkey, vchSig, strMessage, errorMessage)){
+            printf("Got bad masternode address signature\n");
+            pfrom->Misbehaving(20);
+            return false;
+        }
+
+        //printf("Searching existing masternodes : %s - %s\n", addr.ToString().c_str(),  vin.ToString().c_str());
+
+        bool found = false;
+        BOOST_FOREACH(CMasterNode& mn, darkSendMasterNodes) {
+            //printf(" -- %s\n", mn.vin.ToString().c_str());
+
+            if(mn.vin == vin) {
+                found = true;
+                if(!mn.UpdatedWithin(30000)){
+                    mn.UpdateLastSeen();
+                    RelayDarkSendElectionEntry(vin, addr, vchSig, sigTime, pubkey, count, current);
+                    return true;
+                }
+            }
+        }
+
+        if(found) return true;
+
+        printf("Got NEW masternode entry %s\n", addr.ToString().c_str());        
+
+        CValidationState state;
+        CTransaction tx = CTransaction();
+        CTxOut vout = CTxOut(999.99*COIN, darkSendPool.collateralPubKey);
+        tx.vin.push_back(vin);
+        tx.vout.push_back(vout);
+        if(tx.AcceptableInputs(state, true)){
+            printf("Accepted masternode entry %i %i\n", count, current);
+
+            CMasterNode mn(addr, vin, pubkey, vchSig, sigTime);
+            mn.UpdateLastSeen();
+            darkSendMasterNodes.push_back(mn);
+
+            RelayDarkSendElectionEntry(vin, addr, vchSig, sigTime, pubkey, count, current);
+        } else {
+            printf("Rejected masternode entry\n");
+            // if caught up on blocks, then do this:
+            //pfrom->Misbehaving(20);
+        }
+    }
     else if (strCommand == "addr")
     {
         vector<CAddress> vAddr;
@@ -4617,6 +4696,8 @@ public:
 
 CBlockTemplate* CreateNewBlock(CReserveKey& reservekey, int algo)
 {
+    
+    int payments = 1;
     // Create new block
     auto_ptr<CBlockTemplate> pblocktemplate(new CBlockTemplate());
     if(!pblocktemplate.get())
