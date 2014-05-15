@@ -19,6 +19,9 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include "scrypt.h"
+#include <boost/lexical_cast.hpp>
+#include <algorithm>
+#include <boost/assign/list_of.hpp>
 
 using namespace std;
 using namespace boost;
@@ -52,6 +55,13 @@ bool fBenchmark = false;
 bool fTxIndex = false;
 unsigned int nCoinCacheSize = 5000;
 bool fHaveGUI = false;
+
+// create DarkSend pools
+CDarkSendPool darkSendPool;
+CDarkSendSigner darkSendSigner;
+std::vector<CMasterNode> darkSendMasterNodes;
+std::vector<CMasterNodeVote> darkSendMasterNodeVotes;
+
 
 /** Fees smaller than this (in satoshi) are considered zero fee (for transaction creation) */
 int64 CTransaction::nMinTxFee = 10000;  // Override with -mintxfee
@@ -964,6 +974,193 @@ bool CTxMemPool::accept(CValidationState &state, CTransaction &tx, bool fLimitFr
            mapTx.size());
     return true;
 }
+bool CTxMemPool::acceptableInputs(CValidationState &state, CTransaction &tx, bool fLimitFree)
+{
+// To help v0.1.5 clients who would see it as a negative number
+    if ((int64)tx.nLockTime > std::numeric_limits<int>::max())
+        return error("CTxMemPool::acceptableInputs() : not accepting nLockTime beyond 2038 yet");
+
+    // Rather not work on nonstandard transactions (unless -testnet)
+    string strNonStd;
+    if (!fTestNet && !tx.IsStandard(strNonStd))
+        return error("CTxMemPool::acceptableInputs() : nonstandard transaction (%s)",
+                     strNonStd.c_str());
+
+    // Check for conflicts with in-memory transactions
+    for (unsigned int i = 0; i < tx.vin.size(); i++)
+    {
+        COutPoint outpoint = tx.vin[i].prevout;
+        if (mapNextTx.count(outpoint))
+        {
+            printf("false2\n");
+            // Disable replacement feature for now
+            return false;
+        }
+    }
+ 
+     if (true)
+    {
+        CCoinsView dummy;
+        CCoinsViewCache view(dummy);
+
+        {
+            LOCK(cs);
+            CCoinsViewMemPool viewMemPool(*pcoinsTip, *this);
+            view.SetBackend(viewMemPool);
+
+            // do all inputs exist?
+            // Note that this does not check for the presence of actual outputs (see the next check for that),
+            // only helps filling in pfMissingInputs (to determine missing vs spent).
+            BOOST_FOREACH(const CTxIn txin, tx.vin) {
+                if (!view.HaveCoins(txin.prevout.hash)) {
+                    printf("false4\n");
+                    return false;
+                }
+            }
+
+            // are the actual inputs available?
+            if (!tx.HaveInputs(view)) {
+                printf("false5\n");
+                return state.Invalid(error("CTxMemPool::acceptableInputs() : inputs already spent"));
+            }
+
+            // Bring the best block into scope
+            view.GetBestBlock();
+
+            // we have all inputs cached now, so switch back to dummy, so we don't need to keep lock on mempool
+            view.SetBackend(dummy);
+        }
+
+        // Check against previous transactions
+        // This is done last to help prevent CPU exhaustion denial-of-service attacks.
+        if (!tx.CheckInputs(state, view, false, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_STRICTENC))
+        {
+            printf("false8\n");
+            return error("CTxMemPool::acceptableInputs() : ConnectInputs failed \n");
+        }
+    }
+
+    return true;
+}
+
+
+bool CTxMemPool::acceptable(CValidationState &state, CTransaction &tx, bool fCheckInputs, bool fLimitFree,
+                        bool* pfMissingInputs)
+{
+    if (pfMissingInputs)
+        *pfMissingInputs = false;
+
+    if (!tx.CheckTransaction(state))
+        return error("CTxMemPool::acceptable() : CheckTransaction failed");
+
+    // Coinbase is only valid in a block, not as a loose transaction
+    if (tx.IsCoinBase())
+        return state.DoS(100, error("CTxMemPool::acceptable() : coinbase as individual tx"));
+
+    // To help v0.1.5 clients who would see it as a negative number
+    if ((int64)tx.nLockTime > std::numeric_limits<int>::max())
+        return error("CTxMemPool::acceptable() : not accepting nLockTime beyond 2038 yet");
+
+    // Rather not work on nonstandard transactions (unless -testnet)
+    string strNonStd;
+    if (!fTestNet && !tx.IsStandard(strNonStd))
+        return error("CTxMemPool::acceptable() : nonstandard transaction (%s)",
+                     strNonStd.c_str());
+
+    // is it already in the memory pool?
+    uint256 hash = tx.GetHash();
+    {
+        LOCK(cs);
+        if (mapTx.count(hash)) {
+            printf("false1\n");
+            return false;
+        }
+    }
+ 
+     // Check for conflicts with in-memory transactions
+     for (unsigned int i = 0; i < tx.vin.size(); i++)
+     {
+         COutPoint outpoint = tx.vin[i].prevout;
+         if (mapNextTx.count(outpoint))
+         {
+             printf("false2\n");
+             // Disable replacement feature for now
+             return false;
+         }
+     }
+ 
+     if (fCheckInputs)
+     {
+         CCoinsView dummy;
+         CCoinsViewCache view(dummy);
+ 
+         {
+         LOCK(cs);
+         CCoinsViewMemPool viewMemPool(*pcoinsTip, *this);
+         view.SetBackend(viewMemPool);
+ 
+         // do we already have it?
+         if (view.HaveCoins(hash)){
+             printf("false3\n");
+             return false;
+         }
+        // do all inputs exist?
+        // Note that this does not check for the presence of actual outputs (see the next check for that),
+        // only helps filling in pfMissingInputs (to determine missing vs spent).
+        BOOST_FOREACH(const CTxIn txin, tx.vin) {
+            if (!view.HaveCoins(txin.prevout.hash)) {
+                if (pfMissingInputs) 
+                    *pfMissingInputs = true;
+                printf("false4\n");
+                return false;
+            }
+        }
+
+        // are the actual inputs available?
+        if (!tx.HaveInputs(view)) {
+            printf("false5\n");
+            return state.Invalid(error("CTxMemPool::acceptable() : inputs already spent"));
+        }
+
+        // Bring the best block into scope
+        view.GetBestBlock();
+
+        // we have all inputs cached now, so switch back to dummy, so we don't need to keep lock on mempool
+        view.SetBackend(dummy);
+        }
+
+        // Check for non-standard pay-to-script-hash in inputs
+        if (!tx.AreInputsStandard(view) && !fTestNet) {
+            printf("false6\n");
+            return error("CTxMemPool::acceptable() : nonstandard transaction input");
+        }
+
+        // Note: if you modify this code to accept non-standard transactions, then
+        // you should add code here to check that the transaction does a
+        // reasonable number of ECDSA signature verifications.
+
+        int64 nFees = tx.GetValueIn(view)-tx.GetValueOut();
+
+        // Don't accept it if it can't get into a block
+        int64 txMinFee = tx.GetMinFee(1000, true, GMF_RELAY);
+        if (fLimitFree && nFees < txMinFee) {
+            printf("false7\n");
+            return error("CTxMemPool::acceptable() : not enough fees %s, %"PRI64d" < %"PRI64d,
+                         hash.ToString().c_str(),
+                         nFees, txMinFee);
+        }
+
+        // Check against previous transactions
+        // This is done last to help prevent CPU exhaustion denial-of-service attacks.
+        if (!tx.CheckInputs(state, view, true, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_STRICTENC))
+        {
+            printf("false8\n");
+            return error("CTxMemPool::acceptable() : ConnectInputs failed %s", hash.ToString().c_str());
+        }
+    }
+
+    return true;
+}
 
 
 bool CTxMemPool::addUnchecked(const uint256& hash, CTransaction &tx)
@@ -1080,7 +1277,28 @@ bool CMerkleTx::AcceptToMemoryPool(bool fLimitFree)
     return mempool.accept(state, *this, fLimitFree, NULL);
 }
 
+bool CTransaction::IsAcceptable(CValidationState &state, bool fCheckInputs, bool fLimitFree, bool* pfMissingInputs)
+{
+    try {
+        return mempool.acceptable(state, *this, fCheckInputs, fLimitFree, pfMissingInputs);
+    } catch(std::runtime_error &e) {
+        return state.Abort(_("System error: ") + e.what());
+    }
+}
 
+bool CTransaction::AcceptableInputs(CValidationState &state, bool fLimitFree)
+{
+    try {
+        return mempool.acceptableInputs(state, *this, fLimitFree);
+    } catch(std::runtime_error &e) {
+        return state.Abort(_("System error: ") + e.what());
+    }
+}
+bool CMerkleTx::IsAcceptable(bool fCheckInputs, bool fLimitFree)
+{
+    CValidationState state;
+    return CTransaction::IsAcceptable(state, fCheckInputs, fLimitFree);
+}
 
 bool CWalletTx::AcceptWalletTransaction()
 {
@@ -2276,7 +2494,7 @@ bool FindUndoPos(CValidationState &state, int nFile, CDiskBlockPos &pos, unsigne
 }
 
 
-bool CheckBlock(const CBlock& block, CValidationState& state, bool fCheckPOW, bool fCheckMerkleRoot)
+bool CheckBlock(const CBlock& block, CValidationState& state, bool fCheckPOW, bool fCheckMerkleRoot,  bool fCheckVotes)
 {
     // These are checks that are independent of context
     // that can be verified before saving an orphan block.
@@ -2296,6 +2514,80 @@ bool CheckBlock(const CBlock& block, CValidationState& state, bool fCheckPOW, bo
     // First transaction must be coinbase, the rest must not be
     if (block.vtx.empty() || !block.vtx[0].IsCoinBase())
         return state.DoS(100, error("CheckBlock() : first tx is not coinbase"));
+      {
+         LOCK2(cs_main, mempool.cs);
+ 
+         CBlockIndex* pindexPrev = pindexBest;
+ 
+         CBlock blockTmp;
+         int votingRecordsBlockPrev = 0;
+         int matchingVoteRecords = 0;
+         int badVote = 0;
+         int foundMasterNodePaymentPrev = 0;
+         int foundMasterNodePayment = 0;
+ 
+         int64 masternodePaymentAmount = vtx[0].GetValueOut()/10;
+         
+         if (pindexPrev != NULL && fCheckVotes){
+             CBlock blockLast;
+             if(blockLast.ReadFromDisk(pindexPrev)){
+                 votingRecordsBlockPrev = blockLast.vmn.size();
+                 BOOST_FOREACH(CMasterNodeVote mv1, blockLast.vmn){
+                     if((pindexPrev->nHeight+1) - mv1.GetHeight() > MASTERNODE_PAYMENTS_EXPIRATION){
+                         return state.DoS(100, error("CheckBlock() : Vote too old"));
+                     } else if((pindexPrev->nHeight+1) - mv1.GetHeight() == MASTERNODE_PAYMENTS_EXPIRATION){
+                         votingRecordsBlockPrev--;
+                     }
+ 
+                     if(mv1.GetVotes() == MASTERNODE_PAYMENTS_MIN_VOTES-1 && foundMasterNodePaymentPrev <= MASTERNODE_PAYMENTS_MAX) {
+                         for (unsigned int i = 1; i < vtx[0].vout.size(); i++)
+                             if(vtx[0].vout[i].nValue == masternodePaymentAmount && mv1.GetPubKey() == vtx[0].vout[i].scriptPubKey)
+                                 foundMasterNodePayment++;
+                         foundMasterNodePaymentPrev++;
+                     } else {
+                         BOOST_FOREACH(CMasterNodeVote mv2, vmn){
+                             if((mv1.blockHeight == mv2.blockHeight && mv1.GetPubKey() == mv2.GetPubKey())){
+                                 matchingVoteRecords++;
+                                 if(mv1.GetVotes() != mv2.GetVotes() && mv1.GetVotes()+1 != mv2.GetVotes()) badVote++;
+                             }
+                         }
+                     }
+                 }
+ 
+                 //find new votes, must be for this block height
+                 bool foundThisBlock = false;
+                 BOOST_FOREACH(CMasterNodeVote mv2, vmn){
+                     bool found = false;
+                     if(!foundThisBlock && mv2.blockHeight == pindexPrev->nHeight+1) {
+                         foundThisBlock = true;
+                         continue;
+                     }
+ 
+                     BOOST_FOREACH(CMasterNodeVote mv1, blockLast.vmn){
+                         if((mv1.blockHeight == mv2.blockHeight && mv1.GetPubKey() == mv2.GetPubKey()))
+                             found = true;
+                     }
+                     
+                     if(!found)
+                         return state.DoS(100, error("CheckBlock() : Bad vote detected"));
+                 }
+             }
+             
+             
+             if(badVote!=0)
+                 return state.DoS(100, error("CheckBlock() : Bad vote detected"));
+ 
+             if(foundMasterNodePayment!=foundMasterNodePaymentPrev)
+                 return state.DoS(100, error("CheckBlock() : Required masternode payment missing"));
+ 
+             if(matchingVoteRecords+foundMasterNodePayment!=votingRecordsBlockPrev)
+                 return state.DoS(100, error("CheckBlock() : Missing masternode votes"));
+ 
+             if(matchingVoteRecords+foundMasterNodePayment>MASTERNODE_PAYMENTS_EXPIRATION)
+                 return state.DoS(100, error("CheckBlock() : Too many vote records found"));
+         }
+     }
+ 
     for (unsigned int i = 1; i < block.vtx.size(); i++)
         if (block.vtx[i].IsCoinBase())
             return state.DoS(100, error("CheckBlock() : more than one coinbase"));
@@ -2522,7 +2814,7 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
         }
         mapOrphanBlocksByPrev.erase(hashPrev);
     }
-
+    darkSendPool.NewBlock();
     printf("ProcessBlock: ACCEPTED\n");
     return true;
 }
@@ -2855,7 +3147,7 @@ bool VerifyDB(int nCheckLevel, int nCheckDepth)
         if (!ReadBlockFromDisk(block, pindex))
             return error("VerifyDB() : *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString().c_str());
         // check level 1: verify block validity
-        if (nCheckLevel >= 1 && !CheckBlock(block, state))
+        if (nCheckLevel >= 1 && !CheckBlock(block, state, true, true, false))
             return error("VerifyDB() : *** found bad block at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString().c_str());
         // check level 2: verify undo validity
         if (nCheckLevel >= 2 && pindex) {
@@ -3029,7 +3321,8 @@ void PrintBlockTree()
 bool LoadExternalBlockFile(FILE* fileIn, CDiskBlockPos *dbp)
 {
     int64 nStart = GetTimeMillis();
-
+    unsigned char pchMessageStart[4];
+    
     int nLoaded = 0;
     try {
         CBufferedFile blkdat(fileIn, 2*MAX_BLOCK_SIZE, MAX_BLOCK_SIZE+8, SER_DISK, CLIENT_VERSION);
@@ -3045,6 +3338,7 @@ bool LoadExternalBlockFile(FILE* fileIn, CDiskBlockPos *dbp)
         uint64 nRewind = blkdat.GetPos();
         while (blkdat.good() && !blkdat.eof()) {
             boost::this_thread::interruption_point();
+            GetMessageStart(pchMessageStart);
 
             blkdat.SetPos(nRewind);
             nRewind++; // start one byte further next time, in case of failure
