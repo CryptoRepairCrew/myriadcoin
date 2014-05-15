@@ -495,6 +495,7 @@ CAddrDB::CAddrDB()
 
 bool CAddrDB::Write(const CAddrMan& addr)
 {
+    unsigned char pchMessageStart[4] = { 0xaf, 0x45, 0x76, 0xee };
     // Generate random temporary filename
     unsigned short randv = 0;
     RAND_bytes((unsigned char *)&randv, sizeof(randv));
@@ -533,6 +534,7 @@ bool CAddrDB::Write(const CAddrMan& addr)
 
 bool CAddrDB::Read(CAddrMan& addr)
 {
+    unsigned char pchMessageStart[4] = { 0xaf, 0x45, 0x76, 0xee };
     // open input file, and associate with CAutoFile
     FILE *file = fopen(pathAddr.string().c_str(), "rb");
     CAutoFile filein = CAutoFile(file, SER_DISK, CLIENT_VERSION);
